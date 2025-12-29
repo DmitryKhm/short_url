@@ -1,0 +1,223 @@
+name: CI/CD Pipeline for Short URL Service
+
+# Триггеры запуска workflow
+on:
+  # Запуск при push в ветки main или master
+  push:
+    branches: [ "main", "master" ]
+  # Запуск при pull request в эти ветки
+  pull_request:
+    branches: [ "main", "master" ]
+  # Ручной запуск из вкладки Actions
+  workflow_dispatch:
+
+# Переменные окружения
+env:
+  IMAGE_NAME: short-url
+  REGISTRY: ghcr.io  # GitHub Container Registry
+  DOCKERFILE_PATH: ./Dockerfile
+  
+  # Настройки для SSH деплоя (заполнить в Secrets)
+  DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+  DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+  DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+
+# Jobs - последовательность выполнения
+jobs:
+  # Job 1: Тестирование и сборка
+  test-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Шаг 1: Checkout кода
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    # Шаг 2: Настройка Java 17
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+        
+    # Шаг 3: Установка зависимостей Maven
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-m2
+          
+    # Шаг 4: Запуск тестов
+    - name: Run tests with Maven
+      run: mvn test
+      
+    # Шаг 5: Сборка проекта
+    - name: Build with Maven
+      run: mvn clean compile
+      
+    # Шаг 6: Установка QEMU (для сборки multi-arch образов)
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
+    # Шаг 7: Установка Docker Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    # Шаг 8: Логин в GitHub Container Registry
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      if: github.event_name != 'pull_request'
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    # Шаг 9: Извлечение метаданных для Docker
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+          
+    # Шаг 10: Сборка Docker образа
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ${{ env.DOCKERFILE_PATH }}
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    # Шаг 11: Проверка безопасности образа
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: '${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    # Шаг 12: Загрузка результатов безопасности
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+  # Job 2: Деплой на удаленный сервер
+  deploy:
+    needs: test-and-build  # Зависит от успешного выполнения test-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    # Шаг 1: Checkout кода
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    # Шаг 2: Сборка Docker образа для деплоя
+    - name: Build Docker image for deployment
+      run: |
+        docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        
+    # Шаг 3: Сохранение образа в tar архив
+    - name: Save Docker image to tar
+      run: |
+        docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} -o short-url.tar
+        
+    # Шаг 4: Настройка SSH ключа
+    - name: Setup SSH key
+      uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        
+    # Шаг 5: Деплой на удаленный сервер
+    - name: Deploy to remote server
+      env:
+        SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+        SSH_USER: ${{ secrets.DEPLOY_USER }}
+        SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+        DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/short-url' }}
+      run: |
+        # Копируем архив на сервер
+        scp -o StrictHostKeyChecking=no -P $SSH_PORT short-url.tar $SSH_USER@$SSH_HOST:/tmp/
+        
+        # Подключаемся по SSH и разворачиваем
+        ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "
+          # Создаем директорию для приложения
+          sudo mkdir -p $DEPLOY_PATH
+          
+          # Останавливаем старый контейнер
+          docker stop short-url-app || true
+          docker rm short-url-app || true
+          
+          # Загружаем новый образ
+          docker load -i /tmp/short-url.tar
+          
+          # Запускаем новый контейнер
+          docker run -d \
+            --name short-url-app \
+            --restart always \
+            -p 8080:8080 \
+            -v short-url-data:/app/data \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          # Очищаем старые образы
+          docker image prune -f
+          
+          # Удаляем временный файл
+          rm -f /tmp/short-url.tar
+          
+          echo 'Deployment completed successfully!'
+        "
+        
+    # Шаг 6: Проверка деплоя
+    - name: Verify deployment
+      env:
+        SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+        SSH_USER: ${{ secrets.DEPLOY_USER }}
+        SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      run: |
+        ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "
+          # Проверяем, что контейнер запущен
+          docker ps | grep short-url-app
+          
+          # Проверяем здоровье приложения
+          sleep 10
+          curl -f http://localhost:8080/health || exit 1
+          
+          echo 'Application is running and healthy!'
+        "
+        
+  # Job 3: Уведомления (опционально)
+  notifications:
+    needs: [test-and-build, deploy]
+    runs-on: ubuntu-latest
+    if: always()  # Всегда выполняется, даже если другие jobs упали
+    
+    steps:
+    - name: Send success notification
+      if: success()
+      run: |
+        echo "✅ CI/CD pipeline completed successfully!"
+        # Здесь можно добавить отправку в Slack/Telegram/Email
+        # используя соответствующие actions
+        
+    - name: Send failure notification
+      if: failure()
+      run: |
+        echo "❌ CI/CD pipeline failed!"
+        # Уведомление об ошибке
